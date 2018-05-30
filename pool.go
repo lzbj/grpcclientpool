@@ -5,10 +5,10 @@ import (
 	"errors"
 	"github.com/golang/groupcache/lru"
 	"google.golang.org/grpc"
-	"sync"
-	"time"
 	"math/rand"
 	"strconv"
+	"sync"
+	"time"
 )
 
 // ErrorPoolSize means the initial size is wring
@@ -29,11 +29,9 @@ var ErrorConnClosed = errors.New("the grpc connection pool is closed")
 // PoolCapacity set the default pool capacity
 const PoolCapacity = 4 << 1
 
-const length = 4<<1
+const length = 4 << 1
 
-var letters=[]rune("abcdefghijklmnopqrstuvwxyz")
-
-
+var letters = []rune("abcdefghijklmnopqrstuvwxyz")
 
 // Grpc connection pool
 type GrpcClientConnPool struct {
@@ -83,26 +81,26 @@ func NewGrpcClientConnPool(creator ClientConCreator, size int, address string, m
 		if err != nil {
 			return nil, err
 		}
-		con:= grpcClientConn{
+		con := grpcClientConn{
 			ClientConn: cliconn,
 			pool:       pool,
 			timeUsed:   time.Now(),
 			addr:       address,
 			maxDelay:   maxDelay,
 		}
-		pool.conns<-con
-		key :=getconnnectionkey(i,length)
-		pool.cache.Add(key,con)
+		pool.conns <- con
+		key := genconnnectionkey(i, length)
+		pool.cache.Add(key, con)
 	}
 	return pool, nil
 }
 
-func getconnnectionkey(index int, length uint) string{
-	bs :=make([]rune, length)
-	for i:=range bs{
+func genconnnectionkey(index int, length uint) string {
+	bs := make([]rune, length)
+	for i := range bs {
 		bs[i] = letters[rand.Intn(len(letters))]
 	}
-	return strconv.Itoa(index)+string(bs)
+	return strconv.Itoa(index) + string(bs)
 }
 
 // Size return the size of the pool.
