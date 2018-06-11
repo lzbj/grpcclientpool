@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"github.com/golang/groupcache/lru"
+	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 	"math/rand"
 	"strconv"
 	"sync"
 	"time"
 )
+
+var Debug = true
 
 // ErrorPoolSize means the initial size is wring
 var ErrorPoolSize = errors.New("the size of grpc connection pool should be greater than 0")
@@ -25,6 +28,9 @@ var ErrorTimeout = errors.New("the grpc connection pool is timed out")
 
 // ErrorConnClosed means grpc client conn is closed
 var ErrorConnClosed = errors.New("the grpc connection pool is closed")
+
+// ErrorCloseConn means error happened during close grpc conn.
+var ErrCloseConn = errors.New("error happened during close grpc client connection")
 
 // PoolCapacity set the default pool capacity
 const PoolCapacity = 4 << 1
@@ -92,6 +98,9 @@ func NewGrpcClientConnPool(creator ClientConCreator, size int, address string, m
 		key := genconnnectionkey(i, length)
 		pool.cache.Add(key, con)
 	}
+	if Debug {
+		log.Debug().Msgf("created a pool with the size %d ", size)
+	}
 	return pool, nil
 }
 
@@ -136,6 +145,9 @@ func (p *GrpcClientConnPool) ClosePool() error {
 		}
 		err := client.ClientConn.Close()
 		if err != nil {
+			if Debug {
+				log.Info().Msg("error happended when try to close grpc client connection")
+			}
 			return err
 		}
 	}
