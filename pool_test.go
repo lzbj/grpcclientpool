@@ -2,95 +2,93 @@ package connpool
 
 import (
 	"context"
-	"fmt"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 	pb "google.golang.org/grpc/examples/helloworld/helloworld"
 	"google.golang.org/grpc/reflection"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
 
 func TestNewGrpcClientConnPool(t *testing.T) {
-	p, err := NewGrpcClientConnPool(func(addr string, dalay time.Duration) (*grpc.ClientConn, error) {
+	pooSize := 16
+	p, err := NewGrpcConnPool(func(addr string, dalay time.Duration) (*grpc.ClientConn, error) {
 		return grpc.Dial(addr, grpc.WithInsecure())
-	}, 16, "example.com", 3*time.Second, 3*time.Second)
+	}, pooSize, "example.com", 3*time.Second, 3*time.Second)
 
 	if err != nil {
 		t.Errorf("The pool returned an error :%s", err.Error())
 	}
-
-	if a := p.AvailableGrpcClientConn(); a != 16 {
+	if a := p.Available(); a != pooSize {
 		t.Errorf("The pool available should be 16 but %d", a)
 	}
 
-	client, err := p.GetGrpcCliCon(context.Background())
+	client, err := p.Get(context.Background())
 	if err != nil {
 		t.Errorf("Get returned an error : %s", err.Error())
 	}
 	if client == nil {
 		t.Error("client was nil")
 	}
-	if a := p.AvailableGrpcClientConn(); a != 15 {
+	if a := p.Available(); a != pooSize-1 {
 		t.Errorf("The pool available should be 15 but %d", a)
 	}
 
-	err = client.PutBackGrpcClientConn()
+	err = client.Close()
 	if err != nil {
 		t.Errorf("Close returned an error: %s", err.Error())
 	}
 
-	if a := p.AvailableGrpcClientConn(); a != 16 {
+	if a := p.Available(); a != pooSize {
 		t.Errorf("The pool available should be 16 but %d", a)
 	}
 
-	err = client.PutBackGrpcClientConn()
-	if err != ErrorConnClosed {
+	err = client.Close()
+	if err != ErrorPoolFull {
 		t.Errorf("Expected error \"%s\" but got \"%s\"",
-			ErrorConnClosed.Error(), err.Error())
+			ErrorPoolFull.Error(), err.Error())
 	}
 
-	ch1 := make(chan *grpcClientConn, 16)
+	ch1 := make(chan *grpcConn, pooSize)
+
+	var wg sync.WaitGroup
 
 	//consume all
-	for i := 0; i < 16; i++ {
+	for i := 0; i < pooSize; i++ {
+		wg.Add(1)
 		go func() {
-			client, err := p.GetGrpcCliCon(context.Background())
+			client, err := p.Get(context.Background())
 			if err != nil {
 				t.Errorf("Err was not nil: %s", err.Error())
 			}
 
 			ch1 <- client
+			wg.Done()
 		}()
 
 	}
 
-	select {
-	case ch1 <- &grpcClientConn{}:
+	wg.Wait()
 
-	default:
-		if a := p.AvailableGrpcClientConn(); a != 0 {
-			t.Errorf("The pool available was %d but should be 0", a)
-		}
+	if a := p.Available(); a != 0 {
+		t.Errorf("The pool available was %d but should be 0", a)
 	}
-
 	//return all
-	for i := 0; i < 16; i++ {
+	for i := 0; i < pooSize; i++ {
+		wg.Add(1)
 		go func() {
 			conn := <-ch1
-			conn.PutBackGrpcClientConn()
+			conn.Close()
+			wg.Done()
 		}()
 	}
 
-	select {
+	wg.Wait()
 
-	case <-ch1:
-	default:
-		if a := p.AvailableGrpcClientConn(); a != 16 {
-			t.Errorf("The pool available was %d but should be 0", a)
-		}
-
+	if a := p.Available(); a != pooSize {
+		t.Errorf("The pool available was %d but should be 0", a)
 	}
 
 }
@@ -103,7 +101,8 @@ func (s *Server) SayHello(ctx context.Context, in *pb.HelloRequest) (*pb.HelloRe
 	return &pb.HelloReply{Message: "Hello " + in.Name}, nil
 }
 
-func TestTestNewGrpcClientConnPoolSystem(t *testing.T) {
+func TestNewGrpcClientConnPoolSystem(t *testing.T) {
+	poolSize := 100
 	address := ":50052"
 	var defaultName = "world"
 	var i int
@@ -115,25 +114,25 @@ func TestTestNewGrpcClientConnPoolSystem(t *testing.T) {
 	pb.RegisterGreeterServer(s, &Server{})
 	// Register reflection service on gRPC server.
 	reflection.Register(s)
+
 	go func() {
-		select {
-		case <-time.Tick(5 * time.Second):
-			s.Stop()
+		if err := s.Serve(lis); err != nil {
+			t.Fatalf("failed to serve: %v", err)
 		}
-
 	}()
-	if err := s.Serve(lis); err != nil {
-		t.Fatalf("failed to serve: %v", err)
-	}
 
-	p, err := NewGrpcClientConnPool(func(addr string, delay time.Duration) (*grpc.ClientConn, error) {
+	p, err := NewGrpcConnPool(func(addr string, delay time.Duration) (*grpc.ClientConn, error) {
 		return grpc.Dial(addr, grpc.WithInsecure())
-	}, 16, address, 3*time.Second, 1*time.Second)
-	for i = 0; i < p.AvailableGrpcClientConn(); i++ {
-		go func() {
+	}, poolSize, address, 3*time.Second, 1*time.Second)
+
+	var wg sync.WaitGroup
+
+	for i = 0; i < poolSize; i++ {
+		wg.Add(1)
+		go func(i int) {
 			// Set up a connection to the server.
-			fmt.Printf("%s  %s\n", time.Now().Format(time.RFC3339), "connecting")
-			conn, err := p.GetGrpcCliCon(context.Background())
+			t.Logf("%s  %s %d\n", time.Now().Format(time.RFC3339), "connecting ", i)
+			conn, err := p.Get(context.Background())
 			if err != nil {
 				t.Errorf("Get returned an error : %s", err.Error())
 			}
@@ -142,25 +141,24 @@ func TestTestNewGrpcClientConnPoolSystem(t *testing.T) {
 			}
 
 			c := pb.NewGreeterClient(conn.ClientConn)
-			fmt.Printf("%s  %s\n", time.Now().Format(time.RFC3339), "connected")
+			t.Logf("%s  %d %s\n", time.Now().Format(time.RFC3339), i, "connected")
 			r, err := c.SayHello(context.Background(), &pb.HelloRequest{Name: defaultName})
 			if err != nil {
 				t.Fatalf("did not connect: %v", err)
 			}
 			t.Logf("response :%s", r.Message)
-			assert.Equal(t, r.Message, "hell world")
-			conn.PutBackGrpcClientConn()
-		}()
+			assert.Equal(t, r.Message, "Hello world")
+			conn.Close()
+			wg.Done()
+		}(i + 1)
 
 	}
-	select {
-	case p.getGrpcClientConn() <- grpcClientConn{}:
+	wg.Wait()
 
-	default:
-		if a := p.AvailableGrpcClientConn(); a != 16 {
-			t.Errorf("The pool available was %d but should be 16", a)
-		}
+	go s.Stop()
 
+	t.Log("run test ")
+	if a := p.Available(); a != poolSize {
+		t.Errorf("The pool available was %d but should be %d", a, poolSize)
 	}
-
 }
