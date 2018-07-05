@@ -1,15 +1,13 @@
-package connpool
+package grpcpool
 
 import (
 	"context"
 	"errors"
-	"github.com/golang/groupcache/lru"
-	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
-	"math/rand"
-	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
+	"wheels/log"
 )
 
 var Debug = true
@@ -18,155 +16,123 @@ var Debug = true
 var ErrorPoolSize = errors.New("the size of grpc connection pool should be greater than 0")
 
 // ErrorPoolFull means grpc conn pool is full
-var ErrorPoolFull = errors.New("the grpc connection pool is already full")
+var ErrorPoolAlreadyFull = errors.New("the grpc connection pool is already full")
 
 // ErrorPoolClosed means grpc conn poll is closed
-var ErrorPoolClosed = errors.New("the grpc connection pool is already closed")
+var ErrorPoolAlreadyClosed = errors.New("the grpc connection pool is already closed")
 
 // ErrorTimeout means grpc client conn pool timed out
 var ErrorTimeout = errors.New("the grpc connection pool is timed out")
 
 // ErrorConnClosed means grpc client conn is closed
-var ErrorConnClosed = errors.New("the grpc connection pool is closed")
+var ErrorConnAlreadyClosed = errors.New("the grpc connection is closed")
 
 // ErrorCloseConn means error happened during close grpc conn.
 var ErrCloseConn = errors.New("error happened during close grpc client connection")
 
-// PoolCapacity set the default pool capacity
-const PoolCapacity = 4 << 1
-
-const length = 4 << 1
-
-var letters = []rune("abcdefghijklmnopqrstuvwxyz")
+// ErrorCreateConn means error happened during create grpc conn.
+var ErrConnCreation = errors.New("error happened during create grpc client connection")
 
 // Grpc connection pool
 type GrpcConnPool struct {
-	conns       chan grpcConn
-	creator     ClientConCreator
-	idleTimeout time.Duration
-	addr        string
-	maxDelay    time.Duration
-	mu          sync.RWMutex
-	cache       *lru.Cache
+	conns           chan *grpcConn
+	creator         ClientConCreator
+	idleTimeout     time.Duration
+	maxLifeDuration time.Duration
+	mu              sync.RWMutex
 }
 
 // ClientConCreator is grpc ClientConn creator
-type ClientConCreator func(addr string, delay time.Duration) (*grpc.ClientConn, error)
-
-// ClientConHealthChecker is grpc ClientConn healthy checker
-type ClientConHealthChecker func(ctx context.Context, in interface{}, opts ...grpc.CallOption) (interface{}, error)
+type ClientConCreator func() (*grpc.ClientConn, error)
 
 // grpcCliConn wraps a grpc Client connection
 type grpcConn struct {
 	*grpc.ClientConn
-	pool      *GrpcConnPool
-	timeUsed  time.Time
-	unhealthy bool
-	addr      string
-	maxDelay  time.Duration
-	// TODO: Heathy checker: add grpcClientConn heartbeat or health check here.
-	// checker CliConHealthChecker
+	pool        *GrpcConnPool
+	timeUsed    time.Time
+	unhealthy   bool
+	timeCreated time.Time
 }
 
 // NewGrpcClientConnPool creates a pool holds a bunch of live grpc client conns.
-func NewGrpcConnPool(creator ClientConCreator, size int, address string, maxDelay time.Duration, idleTimeout time.Duration) (*GrpcConnPool, error) {
+func NewGrpcConnPool(creator ClientConCreator, size int32, idleTimeout time.Duration, maxLifeDuration time.Duration) (*GrpcConnPool, error) {
 	if size <= 0 {
 		return nil, ErrorPoolSize
 	}
 
 	pool := &GrpcConnPool{
-		conns:       make(chan grpcConn, size),
-		creator:     creator,
-		idleTimeout: idleTimeout,
-		addr:        address,
-		maxDelay:    maxDelay,
-		cache:       lru.New(size),
+		conns:           make(chan *grpcConn, size),
+		creator:         creator,
+		idleTimeout:     idleTimeout,
+		maxLifeDuration: maxLifeDuration,
 	}
-	for i := 0; i < size; i++ {
-		cliconn, err := creator(address, maxDelay)
+
+	var i int32
+	for i = 0; i < size; i++ {
+
+		cliconn, err := creator()
 		if err != nil {
-			return nil, err
+			if Debug {
+				log.Debug("error happened during create grpc client connection")
+				log.Errorf("%v", err)
+				//Insert some placeholder
+				pool.conns <- &grpcConn{
+					pool: pool,
+				}
+			}
 		}
-		con := grpcConn{
-			ClientConn: cliconn,
-			pool:       pool,
-			timeUsed:   time.Now(),
-			addr:       address,
-			maxDelay:   maxDelay,
+		con := &grpcConn{
+			ClientConn:  cliconn,
+			pool:        pool,
+			timeUsed:    time.Now(),
+			timeCreated: time.Now(),
 		}
 		pool.conns <- con
-		key := genconnkey(i, length)
-		pool.cache.Add(key, con)
+
 	}
+
 	if Debug {
-		log.Debug().Msgf("created a pool with the size %d ", size)
+		log.Debug("created a pool with the size %d ", size)
 	}
 	return pool, nil
 }
 
-func genconnkey(index int, length uint) string {
-	bs := make([]rune, length)
-	for i := range bs {
-		bs[i] = letters[rand.Intn(len(letters))]
-	}
-	return strconv.Itoa(index) + string(bs)
-}
-
 // Size return the size of the pool.
-func (p *GrpcConnPool) Size() int {
+func (p *GrpcConnPool) Size() int32 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	size := int32(cap(p.conns))
+
 	if p.PoolIsClosed() {
 		return 0
 	}
-	return cap(p.conns)
+	return atomic.LoadInt32(&size)
+
 }
 
 // AvailableGrpcClientConn returns the available conns.
-func (p *GrpcConnPool) Available() int {
+func (p *GrpcConnPool) Available() int32 {
+
 	if p.PoolIsClosed() {
 		return 0
 	}
-	return len(p.conns)
-}
-
-// ClosePool closes pool.
-func (p *GrpcConnPool) ClosePool() error {
-	p.mu.Lock()
-	clients := p.conns
-	close(p.conns)
-	p.mu.RUnlock()
-	if clients == nil {
-		return nil
-	}
-	close(clients)
-	for i := 0; i < p.Size(); i++ {
-		client := <-clients
-		if client.ClientConn == nil {
-			continue
-		}
-		err := client.ClientConn.Close()
-		if err != nil {
-			if Debug {
-				log.Info().Msg("error happended when try to close grpc client connection")
-			}
-			return err
-		}
-	}
-	return nil
+	avai := int32(len(p.conns))
+	return atomic.LoadInt32(&avai)
 }
 
 // GetGrpcCliCon returns a *grpcClientConn instance.
 func (p *GrpcConnPool) Get(ctx context.Context) (*grpcConn, error) {
 	cliConns := p.getConn()
 	if cliConns == nil {
-		return nil, ErrorPoolClosed
+		return nil, ErrorPoolAlreadyClosed
 	}
 
-	wraper := grpcConn{
+	wraper := &grpcConn{
 		pool: p,
 	}
+
 	select {
-	case con := <-cliConns:
-		wraper = con
+	case wraper = <-cliConns:
 	case <-ctx.Done():
 		return nil, ErrorTimeout
 	}
@@ -179,17 +145,30 @@ func (p *GrpcConnPool) Get(ctx context.Context) (*grpcConn, error) {
 
 	var err error
 	if wraper.ClientConn == nil {
-		wraper.ClientConn, err = p.creator(wraper.addr, wraper.maxDelay)
-		if err != nil {
-			cliConns <- grpcConn{
-				pool: p,
+		go func() (*grpcConn, error) {
+			wraper.ClientConn, err = p.creator()
+			if err != nil {
+				if Debug {
+					log.Debug("error happened during create grpc client connection")
+				}
+				select {
+				case cliConns <- &grpcConn{
+					pool: p,
+				}:
+				default:
+					return nil, err
+				}
+
+				return nil, err
 			}
-		}
+			return wraper, nil
+		}()
+
 	}
-	return &wraper, nil
+	return wraper, nil
 }
 
-func (p *GrpcConnPool) getConn() chan grpcConn {
+func (p *GrpcConnPool) getConn() chan *grpcConn {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.conns
@@ -200,31 +179,60 @@ func (p *GrpcConnPool) PoolIsClosed() bool {
 	return p == nil || p.getConn() == nil
 }
 
+// ClosePool close all client Connections.
+func (p *GrpcConnPool) ClosePool() error {
+	if p.PoolIsClosed() {
+		return ErrorPoolAlreadyClosed
+	}
+
+	conns := p.conns
+	p.conns = nil
+
+	if conns == nil {
+		return nil
+	}
+
+	close(conns)
+	var i int32
+	for i = 0; i < p.Available(); i++ {
+		con := <-conns
+		if con.ClientConn == nil {
+			continue
+		}
+		err := con.ClientConn.Close()
+		if err != nil {
+			log.Debug("error happened during close client connection")
+			return ErrCloseConn
+		}
+	}
+
+	return nil
+
+}
+
 // PutBackGrpcCliConn put cli con back to pool.
 func (cc *grpcConn) Close() error {
-
-	if cc.ClientConn == nil {
-		return ErrorConnClosed
-	}
 
 	if cc == nil {
 		return nil
 	}
 
-	if cc.pool.PoolIsClosed() {
-		return ErrorPoolClosed
+	if cc.ClientConn == nil {
+		return ErrorConnAlreadyClosed
 	}
 
-	clicon := grpcConn{
+	if cc.pool.PoolIsClosed() {
+		return ErrorPoolAlreadyClosed
+	}
+
+	// clone the resources.
+	clicon := &grpcConn{
 		pool:       cc.pool,
 		ClientConn: cc.ClientConn,
 		timeUsed:   time.Now(),
-		addr:       cc.addr,
-		maxDelay:   cc.maxDelay,
 	}
 
-	//TODO: Add more clicon healthy check here.
-	if clicon.unhealthy {
+	if cc.unhealthy {
 		err := clicon.ClientConn.Close()
 		if err != nil {
 			return err
@@ -235,7 +243,9 @@ func (cc *grpcConn) Close() error {
 	select {
 	case cc.pool.conns <- clicon:
 	default:
-		return ErrorPoolFull
+		return ErrorPoolAlreadyFull
 	}
+
+	cc.ClientConn = nil
 	return nil
 }
